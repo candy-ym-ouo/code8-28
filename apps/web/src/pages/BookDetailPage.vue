@@ -345,12 +345,16 @@ async function deleteReflection(reflection: Reflection): Promise<void> {
 
 async function deleteBook(): Promise<void> {
   if (!book.value) return;
-  if (!window.confirm(`确定删除《${book.value.title}》及其全部阅读痕迹吗？此操作不可从界面撤销。`)) return;
+  if (!window.confirm(`确定删除《${book.value.title}》及其全部阅读痕迹吗？24 小时内可以撤销。`)) return;
   try {
     await booksApi.delete(book.value.id, book.value.version);
-    await router.push('/');
+    await router.push({
+      path: '/',
+      state: { deletedBookId: book.value.id, deletedBookTitle: book.value.title }
+    });
   } catch (caught) {
     error.value = caught instanceof ApiError ? caught.message : '删除书目失败';
+    if (caught instanceof ApiError && caught.status === 409) await load();
   }
 }
 

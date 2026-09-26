@@ -9,6 +9,8 @@ import { STATUS_LABELS, type Book, type BookStatus } from '../types/domain';
 const books = ref<Book[]>([]);
 const loading = ref(true);
 const error = ref('');
+const success = ref('');
+const deletedBook = ref<{ id: string; title: string } | null>(null);
 const search = ref('');
 const status = ref<'ALL' | BookStatus>('ALL');
 const page = ref(1);
@@ -45,7 +47,41 @@ function changePage(next: number): void {
   void load();
 }
 
-onMounted(load);
+function clearDeletedBookState(): void {
+  const state = { ...(window.history.state ?? {}) } as Record<string, unknown>;
+  delete state.deletedBookId;
+  delete state.deletedBookTitle;
+  window.history.replaceState(state, '');
+}
+
+function dismissDeletedBook(): void {
+  deletedBook.value = null;
+  clearDeletedBookState();
+}
+
+async function restoreDeletedBook(): Promise<void> {
+  if (!deletedBook.value) return;
+  error.value = '';
+  try {
+    await booksApi.restore(deletedBook.value.id);
+    success.value = `已恢复《${deletedBook.value.title}》及其全部阅读痕迹`;
+    dismissDeletedBook();
+    await load();
+  } catch (caught) {
+    error.value = caught instanceof ApiError ? caught.message : '恢复书目失败';
+  }
+}
+
+onMounted(() => {
+  const state = window.history.state as { deletedBookId?: unknown; deletedBookTitle?: unknown } | null;
+  if (typeof state?.deletedBookId === 'string') {
+    deletedBook.value = {
+      id: state.deletedBookId,
+      title: typeof state.deletedBookTitle === 'string' ? state.deletedBookTitle : ''
+    };
+  }
+  void load();
+});
 </script>
 
 <template>
@@ -75,6 +111,13 @@ onMounted(load);
     </form>
 
     <ErrorNotice :message="error" />
+
+    <div v-if="deletedBook" class="success-notice" role="status">
+      已删除《{{ deletedBook.title }}》，24 小时内可撤销。
+      <button class="text-button" type="button" @click="restoreDeletedBook">撤销删除</button>
+      <button class="text-button" type="button" @click="dismissDeletedBook">知道了</button>
+    </div>
+    <div v-else-if="success" class="success-notice" role="status">{{ success }}</div>
 
     <div v-if="loading" class="state-panel">正在翻阅你的书目…</div>
     <div v-else-if="books.length === 0" class="empty-state card">

@@ -45,6 +45,7 @@ export const booksApi = {
     body: { status: BookStatus; version: number; reflection?: { moodTags: MoodTag[]; text: string } }
   ) => api.patch<{ book: Book; reflection?: Reflection }>(`/books/${id}/status`, body),
   delete: (id: string, version: number) => api.delete<void>(`/books/${id}`, { version }),
+  restore: (id: string) => api.post<{ book: Book }>(`/books/${id}/restore`),
   traces: (id: string, params: URLSearchParams) =>
     api.get<{ items: Trace[]; pagination: Pagination }>(`/books/${id}/traces?${params}`),
   reflections: (id: string) => api.get<{ items: Reflection[] }>(`/books/${id}/reflections`)
