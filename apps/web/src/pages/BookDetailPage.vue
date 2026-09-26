@@ -21,13 +21,15 @@ import {
 } from '../types/domain';
 import { timelineApi } from '../api';
 
-type DeletedItem = { kind: 'DOG_EAR' | 'ANNOTATION' | 'REREAD_MARK' | 'REFLECTION'; id: string; label: string };
+type DeletedItem = { kind: 'DOG_EAR' | 'ANNOTATION' | 'REREAD_MARK' | 'REFLECTION' | 'BOOK'; id: string; label: string };
 type ReflectionEdit = { id: string; version: number; moodTags: MoodTag[]; text: string };
 
 const route = useRoute();
 const router = useRouter();
 const bookId = computed(() => String(route.params.bookId));
 const book = ref<Book | null>(null);
+const bookDeleted = ref(false);
+const deletedBookTitle = ref('');
 const bookView = computed(() => book.value as Book);
 const traces = ref<Trace[]>([]);
 const reflections = ref<Reflection[]>([]);
@@ -244,6 +246,10 @@ async function restoreLastDeleted(): Promise<void> {
     if (item.kind === 'ANNOTATION') await traceApi.restoreAnnotation(item.id);
     if (item.kind === 'REREAD_MARK') await traceApi.restoreReread(item.id);
     if (item.kind === 'REFLECTION') await reflectionApi.restore(item.id);
+    if (item.kind === 'BOOK') {
+      await booksApi.restore(item.id);
+      bookDeleted.value = false;
+    }
     lastDeleted.value = null;
     success.value = '删除已撤销';
     await load();
@@ -345,13 +351,32 @@ async function deleteReflection(reflection: Reflection): Promise<void> {
 
 async function deleteBook(): Promise<void> {
   if (!book.value) return;
-  if (!window.confirm(`确定删除《${book.value.title}》及其全部阅读痕迹吗？此操作不可从界面撤销。`)) return;
+  if (
+    !window.confirm(
+      `删除《${book.value.title}》会一并收起它的折角、批注、重读页和读完感受，24 小时内可整书恢复。确定继续吗？`
+    )
+  )
+    return;
   try {
+    const deletedId = book.value.id;
+    const deletedTitle = book.value.title;
     await booksApi.delete(book.value.id, book.value.version);
-    await router.push('/');
+    deletedBookTitle.value = deletedTitle;
+    bookDeleted.value = true;
+    lastDeleted.value = { kind: 'BOOK', id: deletedId, label: `《${deletedTitle}》及全部痕迹` };
+    success.value = '已随书收起全部痕迹，24 小时内可整书恢复';
   } catch (caught) {
     error.value = caught instanceof ApiError ? caught.message : '删除书目失败';
   }
+}
+
+async function restoreDeletedBook(): Promise<void> {
+  if (!lastDeleted.value || lastDeleted.value.kind !== 'BOOK') return;
+  await restoreLastDeleted();
+}
+
+async function backToBooks(): Promise<void> {
+  await router.push('/');
 }
 
 function eventSummary(payload: Record<string, unknown>): string {
@@ -370,6 +395,19 @@ onMounted(load);
 
 <template>
   <section v-if="loading" class="state-panel">正在读取书页之间的痕迹…</section>
+  <section v-else-if="bookDeleted" class="empty-state card">
+    <span class="empty-mark">收</span>
+    <h1>《{{ deletedBookTitle }}》已收起</h1>
+    <p class="muted">书、折角、批注、重读页和读完感受都已随书收起，24 小时内可以整书恢复。</p>
+    <ErrorNotice :message="error" />
+    <div class="button-row">
+      <button class="button button-primary" type="button" :disabled="saving" @click="restoreDeletedBook">
+        整书恢复（含全部痕迹与感受）
+      </button>
+      <button class="button button-quiet" type="button" @click="backToBooks">回到我的书</button>
+    </div>
+    <p class="muted">也可以稍后在「我的书 → 回收站」里找回。</p>
+  </section>
   <section v-else-if="book">
     <header class="detail-heading">
       <div class="detail-title">

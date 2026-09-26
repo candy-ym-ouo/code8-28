@@ -4,6 +4,7 @@ import AppShell from '../layouts/AppShell.vue';
 import LoginPage from '../pages/LoginPage.vue';
 import RegisterPage from '../pages/RegisterPage.vue';
 import BooksPage from '../pages/BooksPage.vue';
+import TrashPage from '../pages/TrashPage.vue';
 import BookFormPage from '../pages/BookFormPage.vue';
 import BookDetailPage from '../pages/BookDetailPage.vue';
 import TimelinePage from '../pages/TimelinePage.vue';
@@ -20,6 +21,7 @@ export const router = createRouter({
       component: AppShell,
       children: [
         { path: '', name: 'books', component: BooksPage },
+        { path: 'trash', name: 'trash', component: TrashPage },
         { path: 'books/new', name: 'book-new', component: BookFormPage },
         { path: 'books/:bookId', name: 'book-detail', component: BookDetailPage },
         { path: 'books/:bookId/edit', name: 'book-edit', component: BookFormPage },

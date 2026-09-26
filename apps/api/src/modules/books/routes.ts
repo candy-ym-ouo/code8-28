@@ -5,7 +5,7 @@ import { BOOK_STATUSES, MOOD_TAGS, type BookStatus, type MoodTag } from '@paper-
 import { prisma } from '../../lib/prisma.js';
 import { AppError, zodFields } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
-import { normalizeMoodTags, normalizeText, validateStatusTransition } from '../../lib/domain.js';
+import { isRestoreWindowOpen, normalizeMoodTags, normalizeText, validateStatusTransition } from '../../lib/domain.js';
 import { writeEvent } from '../../lib/events.js';
 import { paginationFromQuery, parseId } from '../../lib/http.js';
 
@@ -451,43 +451,76 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
   app.delete('/books/:bookId', async (request, reply) => {
     const bookId = parseId((request.params as { bookId: string }).bookId, 'bookId');
     const userId = currentUser(request).id;
+    // version 为可选项：旧页面删除时不带版本，也必须放行，不能让整本书脱离可控软删。
+    const deleteSchema = z.object({ version: z.number().int().positive().optional() }).optional();
+    const parsed = deleteSchema.safeParse(request.body ?? undefined);
+    if (!parsed.success) {
+      throw new AppError(422, 'VALIDATION_ERROR', '删除参数无效', zodFields(parsed.error));
+    }
+    const requestedVersion = parsed.data?.version;
     await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM books WHERE id = ${bookId}::uuid AND user_id = ${userId}::uuid FOR UPDATE`;
       const book = await tx.book.findFirst({ where: { id: bookId, userId, deletedAt: null } });
       if (!book) throw new AppError(404, 'NOT_FOUND', '书目不存在');
-      const existingVersion = (request.body as { version?: number } | undefined)?.version;
-      if (existingVersion && existingVersion !== book.version) {
+      // version 为可选项：旧页面删除时不带版本，也必须放行，不能让整本书脱离可控软删。
+      if (requestedVersion && requestedVersion !== book.version) {
         throw new AppError(409, 'STALE_WRITE', '书目已在其他位置被修改，请刷新后重试');
       }
       const now = new Date();
+      // 只级联当前仍有效的子记录；此前已单独删除的记录保持其自身删除时间，不被算作随书删除。
       const [dogEars, annotations, rereadMarks, reflections] = await Promise.all([
-        tx.dogEar.findMany({ where: { bookId, deletedAt: null }, select: { id: true } }),
-        tx.annotation.findMany({ where: { bookId, deletedAt: null }, select: { id: true } }),
-        tx.rereadMark.findMany({ where: { bookId, deletedAt: null }, select: { id: true } }),
-        tx.completionReflection.findMany({ where: { bookId, deletedAt: null }, select: { id: true } })
+        tx.dogEar.findMany({ where: { bookId, deletedAt: null, cascadeDeletedAt: null }, select: { id: true, pageNumber: true } }),
+        tx.annotation.findMany({ where: { bookId, deletedAt: null, cascadeDeletedAt: null }, select: { id: true, startPage: true, endPage: true } }),
+        tx.rereadMark.findMany({ where: { bookId, deletedAt: null, cascadeDeletedAt: null }, select: { id: true, pageNumber: true } }),
+        tx.completionReflection.findMany({ where: { bookId, deletedAt: null, cascadeDeletedAt: null }, select: { id: true, completionRound: true } })
       ]);
       await Promise.all([
-        tx.dogEar.updateMany({ where: { bookId, deletedAt: null }, data: { deletedAt: now, version: { increment: 1 } } }),
-        tx.annotation.updateMany({ where: { bookId, deletedAt: null }, data: { deletedAt: now, version: { increment: 1 } } }),
-        tx.rereadMark.updateMany({ where: { bookId, deletedAt: null }, data: { deletedAt: now, version: { increment: 1 } } }),
-        tx.completionReflection.updateMany({ where: { bookId, deletedAt: null }, data: { deletedAt: now, version: { increment: 1 } } })
+        tx.dogEar.updateMany({
+          where: { bookId, deletedAt: null, cascadeDeletedAt: null },
+          data: { deletedAt: now, cascadeDeletedAt: now, version: { increment: 1 } }
+        }),
+        tx.annotation.updateMany({
+          where: { bookId, deletedAt: null, cascadeDeletedAt: null },
+          data: { deletedAt: now, cascadeDeletedAt: now, version: { increment: 1 } }
+        }),
+        tx.rereadMark.updateMany({
+          where: { bookId, deletedAt: null, cascadeDeletedAt: null },
+          data: { deletedAt: now, cascadeDeletedAt: now, version: { increment: 1 } }
+        }),
+        tx.completionReflection.updateMany({
+          where: { bookId, deletedAt: null, cascadeDeletedAt: null },
+          data: { deletedAt: now, cascadeDeletedAt: now, version: { increment: 1 } }
+        })
       ]);
-      await tx.book.update({
-        where: { id: bookId },
+      const updated = await tx.book.updateMany({
+        where: { id: bookId, userId, deletedAt: null, ...(requestedVersion ? { version: book.version } : {}) },
         data: { deletedAt: now, version: { increment: 1 } }
       });
+      if (updated.count !== 1) {
+        throw new AppError(409, 'STALE_WRITE', '书目已在其他位置被修改，请刷新后重试');
+      }
+      // 审计不回抹：书与每条子记录的级联删除都进入时间线，恢复时再写恢复事件。
       await writeEvent(tx, {
         userId,
         bookId,
         entityType: 'BOOK',
         entityId: bookId,
         action: 'DELETED',
-        payload: { bookTitle: book.title }
+        payload: {
+          bookTitle: book.title,
+          cascade: {
+            dogEars: dogEars.length,
+            annotations: annotations.length,
+            rereadMarks: rereadMarks.length,
+            reflections: reflections.length
+          }
+        }
       });
       const childEvents = [
-        ...dogEars.map((item) => ({ entityType: 'DOG_EAR' as const, id: item.id })),
-        ...annotations.map((item) => ({ entityType: 'ANNOTATION' as const, id: item.id })),
-        ...rereadMarks.map((item) => ({ entityType: 'REREAD_MARK' as const, id: item.id })),
-        ...reflections.map((item) => ({ entityType: 'COMPLETION_REFLECTION' as const, id: item.id }))
+        ...dogEars.map((item) => ({ entityType: 'DOG_EAR' as const, id: item.id, payload: { pageNumber: item.pageNumber, cascade: true } })),
+        ...annotations.map((item) => ({ entityType: 'ANNOTATION' as const, id: item.id, payload: { startPage: item.startPage, endPage: item.endPage, cascade: true } })),
+        ...rereadMarks.map((item) => ({ entityType: 'REREAD_MARK' as const, id: item.id, payload: { pageNumber: item.pageNumber, cascade: true } })),
+        ...reflections.map((item) => ({ entityType: 'COMPLETION_REFLECTION' as const, id: item.id, payload: { completionRound: item.completionRound, cascade: true } }))
       ];
       for (const child of childEvents) {
         await writeEvent(tx, {
@@ -496,10 +529,157 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
           entityType: child.entityType,
           entityId: child.id,
           action: 'DELETED',
-          payload: { cascade: true }
+          payload: child.payload
         });
       }
     });
     return reply.status(204).send();
+  });
+
+  // 回收站：列出当前用户在 24 小时恢复窗口内软删的书目。
+  app.get('/books/deleted', async (request) => {
+    const userId = currentUser(request).id;
+    const windowStart = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const books = await prisma.book.findMany({
+      where: { userId, deletedAt: { not: null, gte: windowStart } },
+      orderBy: { deletedAt: 'desc' }
+    });
+    return {
+      items: books.map((book) => ({
+        ...serializeBook(book),
+        deletedAt: book.deletedAt,
+        restorableUntil: new Date(book.deletedAt!.getTime() + 24 * 60 * 60 * 1000)
+      }))
+    };
+  });
+
+  // 恢复整本书：把随书级联删除的痕迹与感受一并恢复，恢复完整影响链。
+  app.post('/books/:bookId/restore', async (request) => {
+    const bookId = parseId((request.params as { bookId: string }).bookId, 'bookId');
+    const userId = currentUser(request).id;
+    const result = await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM books WHERE id = ${bookId}::uuid AND user_id = ${userId}::uuid FOR UPDATE`;
+      const book = await tx.book.findFirst({ where: { id: bookId, userId } });
+      if (!book || !book.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除书目不存在');
+      if (!isRestoreWindowOpen(book.deletedAt)) {
+        throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
+      }
+
+      const [dogEars, annotations, rereadMarks, reflections] = await Promise.all([
+        tx.dogEar.findMany({ where: { bookId, cascadeDeletedAt: { not: null } }, select: { id: true, pageNumber: true } }),
+        tx.annotation.findMany({ where: { bookId, cascadeDeletedAt: { not: null } }, select: { id: true } }),
+        tx.rereadMark.findMany({ where: { bookId, cascadeDeletedAt: { not: null } }, select: { id: true } }),
+        tx.completionReflection.findMany({ where: { bookId, cascadeDeletedAt: { not: null } }, select: { id: true, completionRound: true } })
+      ]);
+
+      // 折角：同页若已存在有效折角（书被删期间新建），则该条不恢复，避免唯一约束冲突。
+      const restoredDogEarIds: string[] = [];
+      for (const dogEar of dogEars) {
+        const blocked = await tx.dogEar.findFirst({
+          where: { bookId, pageNumber: dogEar.pageNumber, deletedAt: null, id: { not: dogEar.id } }
+        });
+        if (blocked) continue;
+        await tx.dogEar.update({
+          where: { id: dogEar.id },
+          data: { deletedAt: null, cascadeDeletedAt: null, version: { increment: 1 } }
+        });
+        restoredDogEarIds.push(dogEar.id);
+      }
+
+      // 批注与重读页不存在同页唯一约束，直接恢复。
+      const restoredAnnotationIds = annotations.map((item) => item.id);
+      const restoredRereadIds = rereadMarks.map((item) => item.id);
+      const [restoredAnnotations, restoredRereads] = await Promise.all([
+        tx.annotation.updateMany({
+          where: { id: { in: restoredAnnotationIds } },
+          data: { deletedAt: null, cascadeDeletedAt: null, version: { increment: 1 } }
+        }),
+        tx.rereadMark.updateMany({
+          where: { id: { in: restoredRereadIds } },
+          data: { deletedAt: null, cascadeDeletedAt: null, version: { increment: 1 } }
+        })
+      ]);
+
+      // 感受：同一完成轮次若已有有效感受（部分唯一索引），跳过该条；
+      // 书被删期间产生了更新轮次时，旧轮次同样跳过恢复。
+      const restoredReflectionIds: string[] = [];
+      for (const reflection of reflections.sort((a, b) => a.completionRound - b.completionRound)) {
+        const blockedByRound = await tx.completionReflection.findFirst({
+          where: { bookId, deletedAt: null, completionRound: { gte: reflection.completionRound }, id: { not: reflection.id } }
+        });
+        if (blockedByRound) continue;
+        await tx.completionReflection.update({
+          where: { id: reflection.id },
+          data: { deletedAt: null, cascadeDeletedAt: null, version: { increment: 1 } }
+        });
+        restoredReflectionIds.push(reflection.id);
+      }
+
+      const restored = await tx.book.update({
+        where: { id: bookId },
+        data: { deletedAt: null, version: { increment: 1 } }
+      });
+
+      // 若书被删前处于已读完，却没有任何有效感受可以随书回来，则回到阅读中，
+      // 与“删除最新感受会回到阅读中”的既有规则保持一致。
+      if (book.status === 'READ') {
+        const activeReflectionCount = await tx.completionReflection.count({ where: { bookId, deletedAt: null } });
+        if (activeReflectionCount === 0) {
+          await tx.book.update({
+            where: { id: bookId },
+            data: { status: 'READING', version: { increment: 1 } }
+          });
+          await writeEvent(tx, {
+            userId,
+            bookId,
+            entityType: 'BOOK',
+            entityId: bookId,
+            action: 'STATUS_CHANGED',
+            payload: { previousStatus: 'READ', nextStatus: 'READING', reason: 'book_restored_without_reflection' }
+          });
+        }
+      }
+
+      await writeEvent(tx, {
+        userId,
+        bookId,
+        entityType: 'BOOK',
+        entityId: bookId,
+        action: 'RESTORED',
+        payload: {
+          bookTitle: restored.title,
+          restored: {
+            dogEars: restoredDogEarIds.length,
+            annotations: restoredAnnotations.count,
+            rereadMarks: restoredRereads.count,
+            reflections: restoredReflectionIds.length
+          },
+          skipped: {
+            dogEars: dogEars.length - restoredDogEarIds.length,
+            annotations: annotations.length - restoredAnnotations.count,
+            rereadMarks: rereadMarks.length - restoredRereads.count,
+            reflections: reflections.length - restoredReflectionIds.length
+          }
+        }
+      });
+      const restoredEvents: Array<{ entityType: 'DOG_EAR' | 'ANNOTATION' | 'REREAD_MARK' | 'COMPLETION_REFLECTION'; id: string }> = [
+        ...restoredDogEarIds.map((id) => ({ entityType: 'DOG_EAR' as const, id })),
+        ...(restoredAnnotations.count ? restoredAnnotationIds.map((id) => ({ entityType: 'ANNOTATION' as const, id })) : []),
+        ...(restoredRereads.count ? restoredRereadIds.map((id) => ({ entityType: 'REREAD_MARK' as const, id })) : []),
+        ...restoredReflectionIds.map((id) => ({ entityType: 'COMPLETION_REFLECTION' as const, id }))
+      ];
+      for (const child of restoredEvents) {
+        await writeEvent(tx, {
+          userId,
+          bookId,
+          entityType: child.entityType,
+          entityId: child.id,
+          action: 'RESTORED',
+          payload: { cascade: true }
+        });
+      }
+      return tx.book.findUniqueOrThrow({ where: { id: bookId } });
+    });
+    return { book: serializeBook(result) };
   });
 };

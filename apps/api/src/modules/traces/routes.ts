@@ -323,7 +323,7 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     const restored = await prisma.$transaction(async (tx) => {
       const value = await tx.dogEar.update({
         where: { id },
-        data: { deletedAt: null, version: { increment: 1 } }
+        data: { deletedAt: null, cascadeDeletedAt: null, version: { increment: 1 } }
       });
       await writeEvent(tx, {
         userId,
@@ -445,7 +445,7 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     const restored = await prisma.$transaction(async (tx) => {
       const value = await tx.annotation.update({
         where: { id },
-        data: { deletedAt: null, version: { increment: 1 } }
+        data: { deletedAt: null, cascadeDeletedAt: null, version: { increment: 1 } }
       });
       await writeEvent(tx, {
         userId,
@@ -566,7 +566,7 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     const restored = await prisma.$transaction(async (tx) => {
       const value = await tx.rereadMark.update({
         where: { id },
-        data: { deletedAt: null, version: { increment: 1 } }
+        data: { deletedAt: null, cascadeDeletedAt: null, version: { increment: 1 } }
       });
       await writeEvent(tx, {
         userId,

@@ -57,6 +57,7 @@ onMounted(load);
         <p>只记录书与你之间发生过什么。</p>
       </div>
       <RouterLink class="button button-primary" to="/books/new">添加书</RouterLink>
+      <RouterLink class="button button-quiet" to="/trash">回收站</RouterLink>
     </header>
 
     <form class="toolbar card" @submit.prevent="submitSearch">

@@ -93,6 +93,11 @@ export interface TimelineEvent {
   occurredAt: string;
 }
 
+export interface DeletedBook extends Omit<Book, 'traceSummary'> {
+  deletedAt: string;
+  restorableUntil: string;
+}
+
 export interface Pagination {
   page: number;
   pageSize: number;

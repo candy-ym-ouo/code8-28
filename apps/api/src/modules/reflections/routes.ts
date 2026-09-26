@@ -196,7 +196,7 @@ export const reflectionRoutes: FastifyPluginAsync = async (app) => {
       }
       const value = await tx.completionReflection.update({
         where: { id },
-        data: { deletedAt: null, version: { increment: 1 } }
+        data: { deletedAt: null, cascadeDeletedAt: null, version: { increment: 1 } }
       });
       await tx.book.update({
         where: { id: existing.bookId },
